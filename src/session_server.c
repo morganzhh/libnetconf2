@@ -952,7 +952,7 @@ nc_server_notif_send(struct nc_session *session, struct nc_server_notif *notif, 
     }
 
     /* reading an RPC and sending a reply must be atomic (no other RPC should be read) */
-    ret = nc_timedlock(session->ti_lock, timeout);
+    ret = nc_timedlock(session->ti_lock, timeout, __func__);
     if (ret < 0) {
         return NC_MSG_ERROR;
     } else if (!ret) {
