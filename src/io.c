@@ -628,6 +628,7 @@ nc_write(struct nc_session *session, const void *buf, size_t count)
                 return -1;
             }
             c = ssh_channel_write(session->ti.libssh.channel, (char *)(buf + written), count - written);
+            usleep(1000);
             if ((c == SSH_ERROR) || (c == -1)) {
                 ERR("Session %u: SSH channel write failed.", session->id);
                 return -1;
