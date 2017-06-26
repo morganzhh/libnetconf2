@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ctype.h>
 #include <libyang/libyang.h>
 
 #include "session.h"
@@ -65,34 +66,42 @@ nc_gettimespec(struct timespec *ts)
 #endif
 }
 
-/* ts1 < ts2, returns milliseconds */
-uint32_t
+/* ts1 < ts2 -> +, ts1 > ts2 -> -, returns milliseconds */
+int32_t
 nc_difftimespec(struct timespec *ts1, struct timespec *ts2)
 {
-    uint64_t nsec_diff = 0;
+    int64_t nsec_diff = 0;
 
-    if (ts1->tv_nsec > ts2->tv_nsec) {
-        ts2->tv_nsec += 1000000000L;
-        --ts2->tv_sec;
-    }
-
-    if (ts1->tv_sec <= ts2->tv_sec) {
-        nsec_diff += (ts2->tv_sec - ts1->tv_sec) * 1000000000L;
-    } else {
-        ERRINT;
-    }
-
-    if (ts1->tv_nsec < ts2->tv_nsec) {
-        nsec_diff += ts2->tv_nsec - ts1->tv_nsec;
-    }
+    nsec_diff += (((int64_t)ts2->tv_sec) - ((int64_t)ts1->tv_sec)) * 1000000000L;
+    nsec_diff += ((int64_t)ts2->tv_nsec) - ((int64_t)ts1->tv_nsec);
 
     return (nsec_diff ? nsec_diff / 1000000L : 0);
+}
+
+void
+nc_addtimespec(struct timespec *ts, uint32_t msec)
+{
+    assert((ts->tv_nsec >= 0) && (ts->tv_nsec < 1000000000L));
+
+    ts->tv_sec += msec / 1000;
+    ts->tv_nsec += (msec % 1000) * 1000000L;
+
+    if (ts->tv_nsec >= 1000000000L) {
+        ++ts->tv_sec;
+        ts->tv_nsec -= 1000000000L;
+    } else if (ts->tv_nsec < 0) {
+        --ts->tv_sec;
+        ts->tv_nsec += 1000000000L;
+    }
+
+    assert((ts->tv_nsec >= 0) && (ts->tv_nsec < 1000000000L));
 }
 
 #ifndef HAVE_PTHREAD_MUTEX_TIMEDLOCK
 int
 pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abstime)
 {
+    int32_t diff;
     int rc;
     struct timespec cur, dur;
 
@@ -100,18 +109,14 @@ pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abstime)
     while ((rc = pthread_mutex_trylock(mutex)) == EBUSY) {
         nc_gettimespec(&cur);
 
-        if ((cur.tv_sec > abstime->tv_sec) || ((cur.tv_sec == abstime->tv_sec) && (cur.tv_nsec >= abstime->tv_nsec))) {
+        if ((diff = nc_difftimespec(&cur, abstime)) < 1) {
+            /* timeout */
             break;
-        }
-
-        dur.tv_sec = abstime->tv_sec - cur.tv_sec;
-        dur.tv_nsec = abstime->tv_nsec - cur.tv_nsec;
-        if (dur.tv_nsec < 0) {
-            dur.tv_sec--;
-            dur.tv_nsec += 1000000000;
-        }
-
-        if ((dur.tv_sec != 0) || (dur.tv_nsec > 5000000)) {
+        } else if (diff < 5) {
+            /* sleep until timeout */
+            dur = *abstime;
+        } else {
+            /* sleep 5 ms */
             dur.tv_sec = 0;
             dur.tv_nsec = 5000000;
         }
@@ -123,44 +128,156 @@ pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abstime)
 }
 #endif
 
+struct nc_session *
+nc_new_session(int not_allocate_ti)
+{
+    struct nc_session *sess;
+
+    sess = calloc(1, sizeof *sess);
+    if (!sess) {
+        return NULL;
+    }
+
+    if (!not_allocate_ti) {
+        sess->ti_lock = malloc(sizeof *sess->ti_lock);
+        sess->ti_cond = malloc(sizeof *sess->ti_cond);
+        sess->ti_inuse = malloc(sizeof *sess->ti_inuse);
+        if (!sess->ti_lock || !sess->ti_cond || !sess->ti_inuse) {
+            free(sess->ti_lock);
+            free(sess->ti_cond);
+            free((int *)sess->ti_inuse);
+            free(sess);
+            return NULL;
+        }
+    }
+
+    return sess;
+}
+
 /*
  * @return 1 - success
  *         0 - timeout
  *        -1 - error
  */
 int
-nc_timedlock(pthread_mutex_t *lock, int timeout, const char *func)
+nc_session_lock(struct nc_session *session, int timeout, const char *func)
 {
     int ret;
     struct timespec ts_timeout;
 
     if (timeout > 0) {
         nc_gettimespec(&ts_timeout);
+        nc_addtimespec(&ts_timeout, timeout);
 
-        ts_timeout.tv_sec += timeout / 1000;
-        ts_timeout.tv_nsec += (timeout % 1000) * 1000000;
-
-        ret = pthread_mutex_timedlock(lock, &ts_timeout);
+        /* LOCK */
+        ret = pthread_mutex_timedlock(session->ti_lock, &ts_timeout);
+        if (!ret) {
+            while (*session->ti_inuse) {
+                ret = pthread_cond_timedwait(session->ti_cond, session->ti_lock, &ts_timeout);
+                if (ret) {
+                    pthread_mutex_unlock(session->ti_lock);
+                    break;
+                }
+            }
+        }
     } else if (!timeout) {
-        ret = pthread_mutex_trylock(lock);
-        if (ret == EBUSY) {
-            /* equivalent in this case */
-            ret = ETIMEDOUT;
+        if (*session->ti_inuse) {
+            /* immediate timeout */
+            return 0;
+        }
+
+        /* LOCK */
+        ret = pthread_mutex_trylock(session->ti_lock);
+        if (!ret) {
+            /* be extra careful, someone could have been faster */
+            if (*session->ti_inuse) {
+                pthread_mutex_unlock(session->ti_lock);
+                return 0;
+            }
         }
     } else { /* timeout == -1 */
-        ret = pthread_mutex_lock(lock);
+        /* LOCK */
+        ret = pthread_mutex_lock(session->ti_lock);
+        if (!ret) {
+            while (*session->ti_inuse) {
+                ret = pthread_cond_wait(session->ti_cond, session->ti_lock);
+                if (ret) {
+                    pthread_mutex_unlock(session->ti_lock);
+                    break;
+                }
+            }
+        }
     }
 
-    if (ret == ETIMEDOUT) {
-        /* timeout */
-        return 0;
-    } else if (ret) {
+    if (ret) {
+        if ((ret == EBUSY) || (ret == ETIMEDOUT)) {
+            /* timeout */
+            return 0;
+        }
+
         /* error */
-        ERR("Mutex lock failed (%s, %s).", func, strerror(ret));
+        ERR("%s: failed to lock a session (%s).", func, strerror(ret));
         return -1;
     }
 
     /* ok */
+    assert(*session->ti_inuse == 0);
+    *session->ti_inuse = 1;
+
+    /* UNLOCK */
+    ret = pthread_mutex_unlock(session->ti_lock);
+    if (ret) {
+        /* error */
+        ERR("%s: faile to unlock a session (%s).", func, strerror(ret));
+        return -1;
+    }
+
+    return 1;
+}
+
+int
+nc_session_unlock(struct nc_session *session, int timeout, const char *func)
+{
+    int ret;
+    struct timespec ts_timeout;
+
+    assert(*session->ti_inuse);
+
+    if (timeout > 0) {
+        nc_gettimespec(&ts_timeout);
+        nc_addtimespec(&ts_timeout, timeout);
+
+        /* LOCK */
+        ret = pthread_mutex_timedlock(session->ti_lock, &ts_timeout);
+    } else if (!timeout) {
+        /* LOCK */
+        ret = pthread_mutex_trylock(session->ti_lock);
+    } else { /* timeout == -1 */
+        /* LOCK */
+        ret = pthread_mutex_lock(session->ti_lock);
+    }
+
+    if (ret && (ret != EBUSY) && (ret != ETIMEDOUT)) {
+        /* error */
+        ERR("%s: failed to lock a session (%s).", func, strerror(ret));
+        return -1;
+    } else if (ret) {
+        WRN("%s: session lock timeout, should not happen.");
+    }
+
+    *session->ti_inuse = 0;
+    pthread_cond_signal(session->ti_cond);
+
+    if (!ret) {
+        /* UNLOCK */
+        ret = pthread_mutex_unlock(session->ti_lock);
+        if (ret) {
+            /* error */
+            ERR("%s: failed to unlock a session (%s).", func, strerror(ret));
+            return -1;
+        }
+    }
+
     return 1;
 }
 
@@ -334,7 +451,7 @@ nc_session_free(struct nc_session *session, void (*data_free)(void *))
     }
 
     if (session->ti_lock) {
-        r = nc_timedlock(session->ti_lock, NC_SESSION_FREE_LOCK_TIMEOUT, __func__);
+        r = nc_session_lock(session, NC_SESSION_FREE_LOCK_TIMEOUT, __func__);
         if (r == -1) {
             return;
         } else if (!r) {
@@ -403,7 +520,7 @@ nc_session_free(struct nc_session *session, void (*data_free)(void *))
         /* list of server's capabilities */
         if (session->opts.client.cpblts) {
             for (i = 0; session->opts.client.cpblts[i]; i++) {
-                lydict_remove(session->ctx, session->opts.client.cpblts[i]);
+                free(session->opts.client.cpblts[i]);
             }
             free(session->opts.client.cpblts);
         }
@@ -530,11 +647,14 @@ nc_session_free(struct nc_session *session, void (*data_free)(void *))
     /* final cleanup */
     if (session->ti_lock) {
         if (locked) {
-            pthread_mutex_unlock(session->ti_lock);
+            nc_session_unlock(session, NC_SESSION_LOCK_TIMEOUT, __func__);
         }
         if (!multisession) {
             pthread_mutex_destroy(session->ti_lock);
+            pthread_cond_destroy(session->ti_cond);
             free(session->ti_lock);
+            free(session->ti_cond);
+            free((int *)session->ti_inuse);
         }
     }
 
@@ -572,7 +692,7 @@ add_cpblt(struct ly_ctx *ctx, const char *capab, const char ***cpblts, int *size
             len = strlen(capab);
         }
         for (i = 0; i < *count; i++) {
-            if (!strncmp((*cpblts)[i], capab, len)) {
+            if (!strncmp((*cpblts)[i], capab, len) && ((*cpblts)[i][len] == '\0' || (*cpblts)[i][len] == '?')) {
                 /* already present, do not duplicate it */
                 return;
             }
@@ -785,7 +905,7 @@ nc_server_get_cpblts(struct ly_ctx *ctx)
                 }
             }
             if (!strcmp(name->value_str, "ietf-yang-library")) {
-                str_len += sprintf(str + str_len, "&module-set-id=%s", module_set_id->value_str);
+                sprintf(str + str_len, "&module-set-id=%s", module_set_id->value_str);
             }
 
             add_cpblt(ctx, str, &cpblts, &size, &count);
@@ -815,11 +935,11 @@ nc_server_get_cpblts(struct ly_ctx *ctx)
 }
 
 static int
-parse_cpblts(struct lyxml_elem *xml, const char ***list)
+parse_cpblts(struct lyxml_elem *xml, char ***list)
 {
     struct lyxml_elem *cpblt;
-    int ver = -1;
-    int i = 0;
+    int ver = -1, i = 0;
+    const char *cpb_start, *cpb_end;
 
     if (list) {
         /* get the storage for server's capabilities */
@@ -844,17 +964,28 @@ parse_cpblts(struct lyxml_elem *xml, const char ***list)
             continue;
         }
 
+        /* skip leading/trailing whitespaces */
+        for (cpb_start = cpblt->content; isspace(cpb_start[0]); ++cpb_start);
+        for (cpb_end = cpblt->content + strlen(cpblt->content); (cpb_end > cpblt->content) && isspace(cpb_end[-1]); --cpb_end);
+        if (!cpb_start[0] || (cpb_end == cpblt->content)) {
+            ERR("Empty capability \"%s\" received.", cpblt->content);
+            return -1;
+        }
+
         /* detect NETCONF version */
-        if (ver < 0 && !strcmp(cpblt->content, "urn:ietf:params:netconf:base:1.0")) {
+        if (ver < 0 && !strncmp(cpb_start, "urn:ietf:params:netconf:base:1.0", cpb_end - cpb_start)) {
             ver = 0;
-        } else if (ver < 1 && !strcmp(cpblt->content, "urn:ietf:params:netconf:base:1.1")) {
+        } else if (ver < 1 && !strncmp(cpb_start, "urn:ietf:params:netconf:base:1.1", cpb_end - cpb_start)) {
             ver = 1;
         }
 
         /* store capabilities */
         if (list) {
-            (*list)[i] = cpblt->content;
-            cpblt->content = NULL;
+            (*list)[i] = strndup(cpb_start, cpb_end - cpb_start);
+            if (!(*list)[i]) {
+                ERRMEM;
+                return -1;
+            }
             i++;
         }
     }

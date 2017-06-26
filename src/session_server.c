@@ -11,6 +11,7 @@
  *
  *     https://opensource.org/licenses/BSD-3-Clause
  */
+#define _POSIX_SOUCE /* signals */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -25,11 +26,16 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <time.h>
+#include <signal.h>
 
 #include "libnetconf.h"
 #include "session_server.h"
 
 struct nc_server_opts server_opts = {
+#ifdef NC_ENABLED_SSH
+    .authkey_lock = PTHREAD_MUTEX_INITIALIZER,
+#endif
+    .bind_lock = PTHREAD_MUTEX_INITIALIZER,
     .endpt_lock = PTHREAD_RWLOCK_INITIALIZER,
     .ch_client_lock = PTHREAD_RWLOCK_INITIALIZER
 };
@@ -37,13 +43,13 @@ struct nc_server_opts server_opts = {
 static nc_rpc_clb global_rpc_clb = NULL;
 
 struct nc_endpt *
-nc_server_endpt_lock(const char *name, NC_TRANSPORT_IMPL ti, uint16_t *idx)
+nc_server_endpt_lock_get(const char *name, NC_TRANSPORT_IMPL ti, uint16_t *idx)
 {
     uint16_t i;
     struct nc_endpt *endpt = NULL;
 
-    /* READ LOCK */
-    pthread_rwlock_rdlock(&server_opts.endpt_lock);
+    /* WRITE LOCK */
+    pthread_rwlock_wrlock(&server_opts.endpt_lock);
 
     for (i = 0; i < server_opts.endpt_count; ++i) {
         if (!strcmp(server_opts.endpts[i].name, name) && (!ti || (server_opts.endpts[i].ti == ti))) {
@@ -54,29 +60,16 @@ nc_server_endpt_lock(const char *name, NC_TRANSPORT_IMPL ti, uint16_t *idx)
 
     if (!endpt) {
         ERR("Endpoint \"%s\" was not found.", name);
-        /* READ UNLOCK */
+        /* UNLOCK */
         pthread_rwlock_unlock(&server_opts.endpt_lock);
         return NULL;
     }
-
-    /* ENDPT LOCK */
-    pthread_mutex_lock(&endpt->lock);
 
     if (idx) {
         *idx = i;
     }
 
     return endpt;
-}
-
-void
-nc_server_endpt_unlock(struct nc_endpt *endpt)
-{
-    /* ENDPT UNLOCK */
-    pthread_mutex_unlock(&endpt->lock);
-
-    /* READ UNLOCK */
-    pthread_rwlock_unlock(&server_opts.endpt_lock);
 }
 
 struct nc_ch_client *
@@ -217,6 +210,7 @@ fail:
 int
 nc_sock_accept_binds(struct nc_bind *binds, uint16_t bind_count, int timeout, char **host, uint16_t *port, uint16_t *idx)
 {
+    sigset_t sigmask, origmask;
     uint16_t i, j, pfd_count;
     struct pollfd *pfd;
     struct sockaddr_storage saddr;
@@ -249,7 +243,11 @@ nc_sock_accept_binds(struct nc_bind *binds, uint16_t bind_count, int timeout, ch
 
     if (sock == -1) {
         /* poll for a new connection */
+        sigfillset(&sigmask);
+        pthread_sigmask(SIG_SETMASK, &sigmask, &origmask);
         ret = poll(pfd, pfd_count, timeout);
+        pthread_sigmask(SIG_SETMASK, &origmask, NULL);
+
         if (!ret) {
             /* we timeouted */
             free(pfd);
@@ -360,6 +358,9 @@ nc_clb_default_get_schema(struct lyd_node *rpc, struct nc_session *UNUSED(sessio
             identifier = ((struct lyd_node_leaf_list *)child)->value_str;
         } else if (!strcmp(child->schema->name, "version")) {
             version = ((struct lyd_node_leaf_list *)child)->value_str;
+            if (version && version[0] == '\0') {
+                version = NULL;
+            }
         } else if (!strcmp(child->schema->name, "format")) {
             format = ((struct lyd_node_leaf_list *)child)->value_str;
         }
@@ -588,13 +589,18 @@ nc_accept_inout(int fdin, int fdout, const char *username, struct nc_session **s
     }
 
     /* prepare session structure */
-    *session = calloc(1, sizeof **session);
+    *session = nc_new_session(0);
     if (!(*session)) {
         ERRMEM;
         return NC_MSG_ERROR;
     }
     (*session)->status = NC_STATUS_STARTING;
     (*session)->side = NC_SERVER;
+
+    /* transport lock */
+    pthread_mutex_init((*session)->ti_lock, NULL);
+    pthread_cond_init((*session)->ti_cond, NULL);
+    *(*session)->ti_inuse = 0;
 
     /* transport specific data */
     (*session)->ti_type = NC_TI_FD;
@@ -666,11 +672,7 @@ nc_ps_lock(struct nc_pollsession *ps, uint8_t *id, const char *func)
     struct timespec ts;
 
     nc_gettimespec(&ts);
-    ts.tv_nsec += NC_PS_LOCK_TIMEOUT * 1000000;
-    while (ts.tv_nsec >= 1000000000L) {
-        ts.tv_nsec -= 1000000000L;
-        ++ts.tv_sec;
-    }
+    nc_addtimespec(&ts, NC_PS_LOCK_TIMEOUT);
 
     /* LOCK */
     ret = pthread_mutex_timedlock(&ps->lock, &ts);
@@ -706,11 +708,7 @@ nc_ps_lock(struct nc_pollsession *ps, uint8_t *id, const char *func)
     /* is it our turn? */
     while (ps->queue[ps->queue_begin] != *id) {
         nc_gettimespec(&ts);
-        ts.tv_nsec += NC_PS_LOCK_TIMEOUT * 1000000;
-        while (ts.tv_nsec >= 1000000000L) {
-            ts.tv_nsec -= 1000000000L;
-            ++ts.tv_sec;
-        }
+        nc_addtimespec(&ts, NC_PS_LOCK_TIMEOUT);
 
         ret = pthread_cond_timedwait(&ps->cond, &ps->lock, &ts);
         if (ret) {
@@ -735,11 +733,7 @@ nc_ps_unlock(struct nc_pollsession *ps, uint8_t id, const char *func)
     struct timespec ts;
 
     nc_gettimespec(&ts);
-    ts.tv_nsec += NC_PS_LOCK_TIMEOUT * 1000000;
-    while (ts.tv_nsec >= 1000000000L) {
-        ts.tv_nsec -= 1000000000L;
-        ++ts.tv_sec;
-    }
+    nc_addtimespec(&ts, NC_PS_LOCK_TIMEOUT);
 
     /* LOCK */
     ret = pthread_mutex_timedlock(&ps->lock, &ts);
@@ -832,7 +826,8 @@ nc_ps_add_session(struct nc_pollsession *ps, struct nc_session *session)
         nc_ps_unlock(ps, q_id, __func__);
         return -1;
     }
-    ps->sessions[ps->session_count - 1] = session;
+    ps->sessions[ps->session_count - 1].session = session;
+    ps->sessions[ps->session_count - 1].state = NC_PS_STATE_NONE;
 
     /* UNLOCK */
     return nc_ps_unlock(ps, q_id, __func__);
@@ -848,7 +843,7 @@ _nc_ps_del_session(struct nc_pollsession *ps, struct nc_session *session, int in
         goto remove;
     }
     for (i = 0; i < ps->session_count; ++i) {
-        if (ps->sessions[i] == session) {
+        if (ps->sessions[i].session == session) {
 remove:
             --ps->session_count;
             if (i < ps->session_count) {
@@ -890,6 +885,36 @@ nc_ps_del_session(struct nc_pollsession *ps, struct nc_session *session)
     ret2 = nc_ps_unlock(ps, q_id, __func__);
 
     return (ret || ret2 ? -1 : 0);
+}
+
+API struct nc_session *
+nc_ps_get_session_by_sid(const struct nc_pollsession *ps, uint32_t sid)
+{
+    uint8_t q_id;
+    uint16_t i;
+    struct nc_session *ret = NULL;
+
+    if (!ps) {
+        ERRARG("ps");
+        return NULL;
+    }
+
+    /* LOCK */
+    if (nc_ps_lock((struct nc_pollsession *)ps, &q_id, __func__)) {
+        return NULL;
+    }
+
+    for (i = 0; i < ps->session_count; ++i) {
+        if (ps->sessions[i].session->id == sid) {
+            ret = ps->sessions[i].session;
+            break;
+        }
+    }
+
+    /* UNLOCK */
+    nc_ps_unlock((struct nc_pollsession *)ps, q_id, __func__);
+
+    return ret;
 }
 
 API uint16_t
@@ -997,7 +1022,7 @@ nc_server_notif_send(struct nc_session *session, struct nc_server_notif *notif, 
     int ret;
 
     /* check parameters */
-    if (!session) {
+    if (!session || (session->side != NC_SERVER) || !session->opts.server.ntf_status) {
         ERRARG("session");
         return NC_MSG_ERROR;
     } else if (!notif || !notif->tree || !notif->eventtime) {
@@ -1006,7 +1031,7 @@ nc_server_notif_send(struct nc_session *session, struct nc_server_notif *notif, 
     }
 
     /* reading an RPC and sending a reply must be atomic (no other RPC should be read) */
-    ret = nc_timedlock(session->ti_lock, timeout, __func__);
+    ret = nc_session_lock(session, timeout, __func__);
     if (ret < 0) {
         return NC_MSG_ERROR;
     } else if (!ret) {
@@ -1018,7 +1043,8 @@ nc_server_notif_send(struct nc_session *session, struct nc_server_notif *notif, 
         ERR("Session %u: failed to write notification.", session->id);
         result = NC_MSG_ERROR;
     }
-    pthread_mutex_unlock(session->ti_lock);
+
+    nc_session_unlock(session, timeout, __func__);
 
     return result;
 }
@@ -1091,233 +1117,267 @@ nc_server_send_reply(struct nc_session *session, struct nc_server_rpc *rpc)
     return ret;
 }
 
-API int
-nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **session)
+/* session must be running and session lock held!
+ * returns: NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR, (msg filled)
+ *          NC_PSPOLL_ERROR, (msg filled)
+ *          NC_PSPOLL_TIMEOUT,
+ *          NC_PSPOLL_RPC (some application data available),
+ *          NC_PSPOLL_SSH_CHANNEL,
+ *          NC_PSPOLL_SSH_MSG
+ */
+static int
+nc_ps_poll_session(struct nc_session *session, time_t now, char *msg)
 {
-    int ret, r, poll_ret;
-    uint8_t q_id;
-    uint16_t i, j;
-    char msg[256];
-    NC_SESSION_TERM_REASON term_reason;
     struct pollfd pfd;
-    struct timespec begin_ts, cur_ts;
-    struct nc_session *cur_session;
-    struct nc_server_rpc *rpc = NULL;
+    int r, ret;
 #ifdef NC_ENABLED_SSH
     struct nc_session *new;
 #endif
 
+    /* check timeout first */
+    if (!(session->flags & NC_SESSION_CALLHOME) && !session->opts.server.ntf_status && server_opts.idle_timeout
+            && (now >= session->opts.server.last_rpc + server_opts.idle_timeout)) {
+        sprintf(msg, "session idle timeout elapsed");
+        session->status = NC_STATUS_INVALID;
+        session->term_reason = NC_SESSION_TERM_TIMEOUT;
+        return NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+    }
+
+    switch (session->ti_type) {
+#ifdef NC_ENABLED_SSH
+    case NC_TI_LIBSSH:
+        r = ssh_channel_poll_timeout(session->ti.libssh.channel, 0, 0);
+        if (r < 1) {
+            if (r == SSH_EOF) {
+                sprintf(msg, "SSH channel unexpected EOF");
+                session->status = NC_STATUS_INVALID;
+                session->term_reason = NC_SESSION_TERM_DROPPED;
+                ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+            } else if (r == SSH_ERROR) {
+                sprintf(msg, "SSH channel poll error (%s)", ssh_get_error(session->ti.libssh.session));
+                session->status = NC_STATUS_INVALID;
+                session->term_reason = NC_SESSION_TERM_OTHER;
+                ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+            } else {
+                ret = NC_PSPOLL_TIMEOUT;
+            }
+            break;
+        }
+
+        /* we have some data, but it may be just an SSH message */
+        r = ssh_execute_message_callbacks(session->ti.libssh.session);
+        if (r != SSH_OK) {
+            sprintf(msg, "failed to receive SSH messages (%s)", ssh_get_error(session->ti.libssh.session));
+            session->status = NC_STATUS_INVALID;
+            session->term_reason = NC_SESSION_TERM_OTHER;
+            ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+        } else if (session->flags & NC_SESSION_SSH_NEW_MSG) {
+            /* new SSH message */
+            session->flags &= ~NC_SESSION_SSH_NEW_MSG;
+            if (session->ti.libssh.next) {
+                for (new = session->ti.libssh.next; new != session; new = new->ti.libssh.next) {
+                    if ((new->status == NC_STATUS_STARTING) && new->ti.libssh.channel
+                            && (new->flags & NC_SESSION_SSH_SUBSYS_NETCONF)) {
+                        /* new NETCONF SSH channel */
+                        ret = NC_PSPOLL_SSH_CHANNEL;
+                        break;
+                    }
+                }
+                if (new != session) {
+                    break;
+                }
+            }
+
+            /* just some SSH message */
+            ret = NC_PSPOLL_SSH_MSG;
+        } else {
+            /* we have some application data */
+            ret = NC_PSPOLL_RPC;
+        }
+        break;
+#endif
+#ifdef NC_ENABLED_TLS
+    case NC_TI_OPENSSL:
+        r = SSL_pending(session->ti.tls);
+        if (!r) {
+            /* no data pending in the SSL buffer, poll fd */
+            pfd.fd = SSL_get_rfd(session->ti.tls);
+            if (pfd.fd < 0) {
+                sprintf(msg, "internal error (%s:%d)", __FILE__, __LINE__);
+                ret = NC_PSPOLL_ERROR;
+                break;
+            }
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            r = poll(&pfd, 1, 0);
+
+            if ((r < 0) && (errno != EINTR)) {
+                sprintf(msg, "poll failed (%s)", strerror(errno));
+                session->status = NC_STATUS_INVALID;
+                ret = NC_PSPOLL_ERROR;
+            } else if (r > 0) {
+                if (pfd.revents & (POLLHUP | POLLNVAL)) {
+                    sprintf(msg, "communication socket unexpectedly closed");
+                    session->status = NC_STATUS_INVALID;
+                    session->term_reason = NC_SESSION_TERM_DROPPED;
+                    ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+                } else if (pfd.revents & POLLERR) {
+                    sprintf(msg, "communication socket error");
+                    session->status = NC_STATUS_INVALID;
+                    session->term_reason = NC_SESSION_TERM_OTHER;
+                    ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+                } else {
+                    ret = NC_PSPOLL_RPC;
+                }
+            } else {
+                ret = NC_PSPOLL_TIMEOUT;
+            }
+        } else {
+            ret = NC_PSPOLL_RPC;
+        }
+        break;
+#endif
+    case NC_TI_FD:
+        pfd.fd = session->ti.fd.in;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        r = poll(&pfd, 1, 0);
+
+        if ((r < 0) && (errno != EINTR)) {
+            sprintf(msg, "poll failed (%s)", strerror(errno));
+            session->status = NC_STATUS_INVALID;
+            ret = NC_PSPOLL_ERROR;
+        } else if (r > 0) {
+            if (pfd.revents & (POLLHUP | POLLNVAL)) {
+                sprintf(msg, "communication socket unexpectedly closed");
+                session->status = NC_STATUS_INVALID;
+                session->term_reason = NC_SESSION_TERM_DROPPED;
+                ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+            } else if (pfd.revents & POLLERR) {
+                sprintf(msg, "communication socket error");
+                session->status = NC_STATUS_INVALID;
+                session->term_reason = NC_SESSION_TERM_OTHER;
+                ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+            } else {
+                ret = NC_PSPOLL_RPC;
+            }
+        } else {
+            ret = NC_PSPOLL_TIMEOUT;
+        }
+        break;
+    case NC_TI_NONE:
+        sprintf(msg, "internal error (%s:%d)", __FILE__, __LINE__);
+        ret = NC_PSPOLL_ERROR;
+        break;
+    }
+
+    return ret;
+}
+
+API int
+nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **session)
+{
+    int ret, r;
+    uint8_t q_id;
+    uint16_t i, j;
+    char msg[256];
+    struct timespec ts_timeout, ts_cur;
+    struct nc_session *cur_session;
+    struct nc_server_rpc *rpc = NULL;
+
     if (!ps) {
         ERRARG("ps");
         return NC_PSPOLL_ERROR;
-    } else if (!ps->session_count) {
-        return NC_PSPOLL_NOSESSIONS;
     }
 
-    nc_gettimespec(&begin_ts);
-
-    /* LOCK */
+    /* PS LOCK */
     if (nc_ps_lock(ps, &q_id, __func__)) {
         return NC_PSPOLL_ERROR;
     }
 
-    /* check that all session are fine */
-    for (i = 0; i < ps->session_count; ++i) {
-        if (ps->sessions[i]->status != NC_STATUS_RUNNING) {
-            ERR("Session %u: session not running.", ps->sessions[i]->id);
-            ret = NC_PSPOLL_ERROR;
-            if (session) {
-                *session = ps->sessions[i];
-            }
-            goto finish;
-        }
-
-        /* TODO invalidate only sessions without subscription */
-        if (!(ps->sessions[i]->flags & NC_SESSION_CALLHOME) && server_opts.idle_timeout
-                && (begin_ts.tv_sec >= ps->sessions[i]->opts.server.last_rpc + server_opts.idle_timeout)) {
-            ERR("Session %u: session idle timeout elapsed.", ps->sessions[i]->id);
-            ps->sessions[i]->status = NC_STATUS_INVALID;
-            ps->sessions[i]->term_reason = NC_SESSION_TERM_TIMEOUT;
-            ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
-            if (session) {
-                *session = ps->sessions[i];
-            }
-            goto finish;
-        }
+    if (!ps->session_count) {
+        nc_ps_unlock(ps, q_id, __func__);
+        return NC_PSPOLL_NOSESSIONS;
     }
 
-    /* poll on all the sessions one-by-one */
+    /* fill timespecs */
+    nc_gettimespec(&ts_cur);
+    if (timeout > -1) {
+        nc_gettimespec(&ts_timeout);
+        nc_addtimespec(&ts_timeout, timeout);
+    }
+
+    /* poll all the sessions one-by-one */
     do {
-        /* loop from i to j */
+        /* loop from i to j once (all sessions) */
         if (ps->last_event_session == ps->session_count - 1) {
             i = j = 0;
         } else {
             i = j = ps->last_event_session + 1;
         }
         do {
-            cur_session = ps->sessions[i];
+            cur_session = ps->sessions[i].session;
 
-            switch (cur_session->ti_type) {
+            /* SESSION LOCK */
+            r = nc_session_lock(cur_session, 0, __func__);
+            if (r == -1) {
+                ret = NC_PSPOLL_ERROR;
+            } else if (r == 1) {
+                /* no one else is currently working with the session, so we can, otherwise skip it */
+                if (ps->sessions[i].state == NC_PS_STATE_NONE) {
+                    if (cur_session->status == NC_STATUS_RUNNING) {
+                        /* session is fine, work with it */
+                        ps->sessions[i].state = NC_PS_STATE_BUSY;
+
+                        ret = nc_ps_poll_session(cur_session, ts_cur.tv_sec, msg);
+                        switch (ret) {
+                        case NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR:
+                            ERR("Session %u: %s.", cur_session->id, msg);
+                            ps->sessions[i].state = NC_PS_STATE_INVALID;
+                            break;
+                        case NC_PSPOLL_ERROR:
+                            ERR("Session %u: %s.", cur_session->id, msg);
+                            ps->sessions[i].state = NC_PS_STATE_NONE;
+                            break;
+                        case NC_PSPOLL_TIMEOUT:
 #ifdef NC_ENABLED_SSH
-            case NC_TI_LIBSSH:
-                r = ssh_channel_poll_timeout(cur_session->ti.libssh.channel, 0, 0);
-                if (r < 1) {
-                    if (r == SSH_EOF) {
-                        sprintf(msg, "SSH channel unexpected EOF");
-                        term_reason = NC_SESSION_TERM_DROPPED;
-                        poll_ret = -2;
-                    } else if (r == SSH_ERROR) {
-                        sprintf(msg, "SSH channel poll error (%s)", ssh_get_error(cur_session->ti.libssh.session));
-                        term_reason = NC_SESSION_TERM_OTHER;
-                        poll_ret = -2;
-                    } else {
-                        poll_ret = 0;
-                    }
-                    break;
-                }
-                /* we have some data, but it may be just an SSH message */
-
-                r = nc_timedlock(cur_session->ti_lock, timeout, __func__);
-                if (r < 0) {
-                    if (session) {
-                        *session = cur_session;
-                    }
-                    ret = NC_PSPOLL_ERROR;
-                    goto finish;
-                } else if (!r) {
-                    if (session) {
-                        *session = cur_session;
-                    }
-                    ret = NC_PSPOLL_TIMEOUT;
-                    goto finish;
-                }
-                r = ssh_execute_message_callbacks(cur_session->ti.libssh.session);
-                pthread_mutex_unlock(cur_session->ti_lock);
-
-                if (r != SSH_OK) {
-                    sprintf(msg, "failed to receive SSH messages (%s)", ssh_get_error(cur_session->ti.libssh.session));
-                    term_reason = NC_SESSION_TERM_OTHER;
-                    poll_ret = -2;
-                } else if (cur_session->flags & NC_SESSION_SSH_NEW_MSG) {
-                    /* new SSH message */
-                    cur_session->flags &= ~NC_SESSION_SSH_NEW_MSG;
-                    if (cur_session->ti.libssh.next) {
-                        for (new = cur_session->ti.libssh.next; new != cur_session; new = new->ti.libssh.next) {
-                            if ((new->status == NC_STATUS_STARTING) && new->ti.libssh.channel
-                                    && (new->flags & NC_SESSION_SSH_SUBSYS_NETCONF)) {
-                                /* new NETCONF SSH channel */
-                                if (session) {
-                                    *session = cur_session;
-                                }
-                                ret = NC_PSPOLL_SSH_CHANNEL;
-                                goto finish;
-                            }
-                        }
-                    }
-
-                    /* just some SSH message */
-                    if (session) {
-                        *session = cur_session;
-                    }
-                    ret = NC_PSPOLL_SSH_MSG;
-                    goto finish;
-                } else {
-                    /* we have some application data */
-                    poll_ret = 1;
-                }
-                break;
+                        case NC_PSPOLL_SSH_CHANNEL:
+                        case NC_PSPOLL_SSH_MSG:
 #endif
-#ifdef NC_ENABLED_TLS
-            case NC_TI_OPENSSL:
-                r = SSL_pending(cur_session->ti.tls);
-                if (!r) {
-                    /* no data pending in the SSL buffer, poll fd */
-                    pfd.fd = SSL_get_rfd(cur_session->ti.tls);
-                    if (pfd.fd < 0) {
-                        ERRINT;
-                        ret = NC_PSPOLL_ERROR;
-                        goto finish;
-                    }
-                    pfd.events = POLLIN;
-                    pfd.revents = 0;
-                    r = poll(&pfd, 1, 0);
-
-                    if (r < 0) {
-                        sprintf(msg, "poll failed (%s)", strerror(errno));
-                        poll_ret = -1;
-                    } else if (r > 0) {
-                        if (pfd.revents & (POLLHUP | POLLNVAL)) {
-                            sprintf(msg, "communication socket unexpectedly closed");
-                            term_reason = NC_SESSION_TERM_DROPPED;
-                            poll_ret = -2;
-                        } else if (pfd.revents & POLLERR) {
-                            sprintf(msg, "communication socket error");
-                            term_reason = NC_SESSION_TERM_OTHER;
-                            poll_ret = -2;
-                        } else {
-                            poll_ret = 1;
+                            ps->sessions[i].state = NC_PS_STATE_NONE;
+                            break;
+                        case NC_PSPOLL_RPC:
+                            /* let's keep the state busy, we are not done with this session */
+                            break;
                         }
                     } else {
-                        poll_ret = 0;
+                        /* session is not fine, let the caller know */
+                        ret = NC_PSPOLL_SESSION_TERM;
+                        if (cur_session->term_reason != NC_SESSION_TERM_CLOSED) {
+                            ret |= NC_PSPOLL_SESSION_ERROR;
+                        }
+                        ps->sessions[i].state = NC_PS_STATE_INVALID;
                     }
-                } else {
-                    poll_ret = 1;
+                } else if (ps->sessions[i].state == NC_PS_STATE_BUSY) {
+                    /* it definitely should not be busy because we have the lock */
+                    ERRINT;
                 }
-                break;
-#endif
-            case NC_TI_FD:
-                pfd.fd = cur_session->ti.fd.in;
-                pfd.events = POLLIN;
-                pfd.revents = 0;
-                r = poll(&pfd, 1, 0);
 
-                if (r < 0) {
-                    sprintf(msg, "poll failed (%s)", strerror(errno));
-                    poll_ret = -1;
-                } else if (r > 0) {
-                    if (pfd.revents & (POLLHUP | POLLNVAL)) {
-                        sprintf(msg, "communication socket unexpectedly closed");
-                        term_reason = NC_SESSION_TERM_DROPPED;
-                        poll_ret = -2;
-                    } else if (pfd.revents & POLLERR) {
-                        sprintf(msg, "communication socket error");
-                        term_reason = NC_SESSION_TERM_OTHER;
-                        poll_ret = -2;
-                    } else {
-                        poll_ret = 1;
-                    }
-                } else {
-                    poll_ret = 0;
+                /* keep the session locked only in this one case */
+                if (ret != NC_PSPOLL_RPC) {
+                    /* SESSION UNLOCK */
+                    nc_session_unlock(cur_session, NC_SESSION_LOCK_TIMEOUT, __func__);
                 }
-                break;
-            case NC_TI_NONE:
-                ERRINT;
-                ret = NC_PSPOLL_ERROR;
-                goto finish;
+            } else {
+                /* timeout */
+                ret = NC_PSPOLL_TIMEOUT;
             }
 
-             /* here: poll_ret == -2 - session error, session terminated,
-              *       poll_ret == -1 - generic error,
-              *       poll_ret == 0 - nothing to read,
-              *       poll_ret > 0 - data available */
-            if (poll_ret == -2) {
-                ERR("Session %u: %s.", cur_session->id, msg);
-                cur_session->status = NC_STATUS_INVALID;
-                cur_session->term_reason = term_reason;
-                if (session) {
-                    *session = cur_session;
-                }
-                ret = NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
-                goto finish;
-            } else if (poll_ret == -1) {
-                ERR("Session %u: %s.", cur_session->id, msg);
-                ret = NC_PSPOLL_ERROR;
-                goto finish;
-            } else if (poll_ret > 0) {
+            /* something happened */
+            if (ret != NC_PSPOLL_TIMEOUT) {
                 break;
             }
 
-            /* next iteration */
             if (i == ps->session_count - 1) {
                 i = 0;
             } else {
@@ -1325,62 +1385,72 @@ nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **session)
             }
         } while (i != j);
 
-        /* no event */
-        if (!poll_ret && (timeout > -1)) {
+        /* no event, no session remains locked */
+        if (ret == NC_PSPOLL_TIMEOUT) {
             usleep(NC_TIMEOUT_STEP);
+            /* update current time */
+            nc_gettimespec(&ts_cur);
 
-            nc_gettimespec(&cur_ts);
-            /* final timeout */
-            if (nc_difftimespec(&begin_ts, &cur_ts) >= (unsigned)timeout) {
-                ret = NC_PSPOLL_TIMEOUT;
-                goto finish;
+            if ((timeout > -1) && (nc_difftimespec(&ts_cur, &ts_timeout) < 1)) {
+                /* final timeout */
+                break;
             }
         }
-    } while (!poll_ret);
+    } while (ret == NC_PSPOLL_TIMEOUT);
 
-    /* this is the session with some data available for reading */
-    if (session) {
-        *session = cur_session;
-    }
-    ps->last_event_session = i;
-
-    /* reading an RPC and sending a reply must be atomic (no other RPC should be read) */
-    r = nc_timedlock(cur_session->ti_lock, timeout, __func__);
-    if (r < 0) {
-        ret = NC_PSPOLL_ERROR;
-        goto finish;
-    } else if (!r) {
-        ret = NC_PSPOLL_TIMEOUT;
-        goto finish;
-    }
-
-    ret = nc_server_recv_rpc(cur_session, &rpc);
-    if (ret & (NC_PSPOLL_ERROR | NC_PSPOLL_BAD_RPC)) {
-        pthread_mutex_unlock(cur_session->ti_lock);
-        if (cur_session->status != NC_STATUS_RUNNING) {
-            ret |= NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+    /* do we want to return the session? */
+    switch (ret) {
+    case NC_PSPOLL_RPC:
+    case NC_PSPOLL_SESSION_TERM:
+    case NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR:
+#ifdef NC_ENABLED_SSH
+    case NC_PSPOLL_SSH_CHANNEL:
+    case NC_PSPOLL_SSH_MSG:
+#endif
+        if (session) {
+            *session = cur_session;
         }
-        goto finish;
+        ps->last_event_session = i;
+        break;
+    default:
+        break;
     }
 
-    cur_session->opts.server.last_rpc = time(NULL);
-
-    /* process RPC */
-    ret |= nc_server_send_reply(cur_session, rpc);
-
-    pthread_mutex_unlock(cur_session->ti_lock);
-    if (cur_session->status != NC_STATUS_RUNNING) {
-        ret |= NC_PSPOLL_SESSION_TERM;
-        if (!(cur_session->term_reason & (NC_SESSION_TERM_CLOSED | NC_SESSION_TERM_KILLED))) {
-            ret |= NC_PSPOLL_SESSION_ERROR;
-        }
-    }
-
-    nc_server_rpc_free(rpc, server_opts.ctx);
-
-finish:
-    /* UNLOCK */
+    /* PS UNLOCK */
     nc_ps_unlock(ps, q_id, __func__);
+
+    /* we have some data available and the session is locked */
+    if (ret == NC_PSPOLL_RPC) {
+        ret = nc_server_recv_rpc(cur_session, &rpc);
+        if (ret & (NC_PSPOLL_ERROR | NC_PSPOLL_BAD_RPC)) {
+            if (cur_session->status != NC_STATUS_RUNNING) {
+                ret |= NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
+                ps->sessions[i].state = NC_PS_STATE_INVALID;
+            } else {
+                ps->sessions[i].state = NC_PS_STATE_NONE;
+            }
+        } else {
+            cur_session->opts.server.last_rpc = time(NULL);
+
+            /* process RPC, not needed afterwards */
+            ret |= nc_server_send_reply(cur_session, rpc);
+            nc_server_rpc_free(rpc, server_opts.ctx);
+
+            if (cur_session->status != NC_STATUS_RUNNING) {
+                ret |= NC_PSPOLL_SESSION_TERM;
+                if (!(cur_session->term_reason & (NC_SESSION_TERM_CLOSED | NC_SESSION_TERM_KILLED))) {
+                    ret |= NC_PSPOLL_SESSION_ERROR;
+                }
+                ps->sessions[i].state = NC_PS_STATE_INVALID;
+            } else {
+                ps->sessions[i].state = NC_PS_STATE_NONE;
+            }
+        }
+
+        /* SESSION UNLOCK */
+        nc_session_unlock(cur_session, NC_SESSION_LOCK_TIMEOUT, __func__);
+    }
+
     return ret;
 }
 
@@ -1403,7 +1473,7 @@ nc_ps_clear(struct nc_pollsession *ps, int all, void (*data_free)(void *))
 
     if (all) {
         for (i = 0; i < ps->session_count; i++) {
-            nc_session_free(ps->sessions[i], data_free);
+            nc_session_free(ps->sessions[i].session, data_free);
         }
         free(ps->sessions);
         ps->sessions = NULL;
@@ -1411,8 +1481,8 @@ nc_ps_clear(struct nc_pollsession *ps, int all, void (*data_free)(void *))
         ps->last_event_session = 0;
     } else {
         for (i = 0; i < ps->session_count; ) {
-            if (ps->sessions[i]->status != NC_STATUS_RUNNING) {
-                session = ps->sessions[i];
+            if (ps->sessions[i].session->status != NC_STATUS_RUNNING) {
+                session = ps->sessions[i].session;
                 _nc_ps_del_session(ps, NULL, i);
                 nc_session_free(session, data_free);
                 continue;
@@ -1432,22 +1502,25 @@ API int
 nc_server_add_endpt(const char *name, NC_TRANSPORT_IMPL ti)
 {
     uint16_t i;
+    int ret = 0;
 
     if (!name) {
         ERRARG("name");
         return -1;
     }
 
-    /* WRITE LOCK */
+    /* BIND LOCK */
+    pthread_mutex_lock(&server_opts.bind_lock);
+
+    /* ENDPT WRITE LOCK */
     pthread_rwlock_wrlock(&server_opts.endpt_lock);
 
     /* check name uniqueness */
     for (i = 0; i < server_opts.endpt_count; ++i) {
         if (!strcmp(server_opts.endpts[i].name, name)) {
             ERR("Endpoint \"%s\" already exists.", name);
-            /* WRITE UNLOCK */
-            pthread_rwlock_unlock(&server_opts.endpt_lock);
-            return -1;
+            ret = -1;
+            goto cleanup;
         }
     }
 
@@ -1455,21 +1528,17 @@ nc_server_add_endpt(const char *name, NC_TRANSPORT_IMPL ti)
     server_opts.endpts = nc_realloc(server_opts.endpts, server_opts.endpt_count * sizeof *server_opts.endpts);
     if (!server_opts.endpts) {
         ERRMEM;
-        /* WRITE UNLOCK */
-        pthread_rwlock_unlock(&server_opts.endpt_lock);
-        return -1;
+        ret = -1;
+        goto cleanup;
     }
     server_opts.endpts[server_opts.endpt_count - 1].name = lydict_insert(server_opts.ctx, name, 0);
     server_opts.endpts[server_opts.endpt_count - 1].ti = ti;
 
-    pthread_mutex_init(&server_opts.endpts[server_opts.endpt_count - 1].lock, NULL);
-
     server_opts.binds = nc_realloc(server_opts.binds, server_opts.endpt_count * sizeof *server_opts.binds);
     if (!server_opts.binds) {
         ERRMEM;
-        /* WRITE UNLOCK */
-        pthread_rwlock_unlock(&server_opts.endpt_lock);
-        return -1;
+        ret = -1;
+        goto cleanup;
     }
 
     server_opts.binds[server_opts.endpt_count - 1].address = NULL;
@@ -1483,9 +1552,8 @@ nc_server_add_endpt(const char *name, NC_TRANSPORT_IMPL ti)
         server_opts.endpts[server_opts.endpt_count - 1].opts.ssh = calloc(1, sizeof(struct nc_server_ssh_opts));
         if (!server_opts.endpts[server_opts.endpt_count - 1].opts.ssh) {
             ERRMEM;
-            /* WRITE UNLOCK */
-            pthread_rwlock_unlock(&server_opts.endpt_lock);
-            return -1;
+            ret = -1;
+            goto cleanup;
         }
         server_opts.endpts[server_opts.endpt_count - 1].opts.ssh->auth_methods =
             NC_SSH_AUTH_PUBLICKEY | NC_SSH_AUTH_PASSWORD | NC_SSH_AUTH_INTERACTIVE;
@@ -1498,23 +1566,25 @@ nc_server_add_endpt(const char *name, NC_TRANSPORT_IMPL ti)
         server_opts.endpts[server_opts.endpt_count - 1].opts.tls = calloc(1, sizeof(struct nc_server_tls_opts));
         if (!server_opts.endpts[server_opts.endpt_count - 1].opts.tls) {
             ERRMEM;
-            /* WRITE UNLOCK */
-            pthread_rwlock_unlock(&server_opts.endpt_lock);
-            return -1;
+            ret = -1;
+            goto cleanup;
         }
         break;
 #endif
     default:
         ERRINT;
-        /* WRITE UNLOCK */
-        pthread_rwlock_unlock(&server_opts.endpt_lock);
-        return -1;
+        ret = -1;
+        goto cleanup;
     }
 
-    /* WRITE UNLOCK */
+cleanup:
+    /* ENDPT UNLOCK */
     pthread_rwlock_unlock(&server_opts.endpt_lock);
 
-    return 0;
+    /* BIND UNLOCK */
+    pthread_mutex_unlock(&server_opts.bind_lock);
+
+    return ret;
 }
 
 int
@@ -1539,9 +1609,14 @@ nc_server_endpt_set_address_port(const char *endpt_name, const char *address, ui
         set_addr = 0;
     }
 
-    /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, 0, &i);
+    /* BIND LOCK */
+    pthread_mutex_lock(&server_opts.bind_lock);
+
+    /* ENDPT LOCK */
+    endpt = nc_server_endpt_lock_get(endpt_name, 0, &i);
     if (!endpt) {
+        /* BIND UNLOCK */
+        pthread_mutex_unlock(&server_opts.bind_lock);
         return -1;
     }
 
@@ -1586,8 +1661,11 @@ nc_server_endpt_set_address_port(const char *endpt_name, const char *address, ui
     }
 
 cleanup:
-    /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    /* ENDPT UNLOCK */
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
+
+    /* BIND UNLOCK */
+    pthread_mutex_unlock(&server_opts.bind_lock);
 
     return ret;
 }
@@ -1610,14 +1688,16 @@ nc_server_del_endpt(const char *name, NC_TRANSPORT_IMPL ti)
     uint32_t i;
     int ret = -1;
 
-    /* WRITE LOCK */
+    /* BIND LOCK */
+    pthread_mutex_lock(&server_opts.bind_lock);
+
+    /* ENDPT WRITE LOCK */
     pthread_rwlock_wrlock(&server_opts.endpt_lock);
 
     if (!name && !ti) {
         /* remove all endpoints */
         for (i = 0; i < server_opts.endpt_count; ++i) {
             lydict_remove(server_opts.ctx, server_opts.endpts[i].name);
-            pthread_mutex_destroy(&server_opts.endpts[i].lock);
             switch (server_opts.endpts[i].ti) {
 #ifdef NC_ENABLED_SSH
             case NC_TI_LIBSSH:
@@ -1659,7 +1739,6 @@ nc_server_del_endpt(const char *name, NC_TRANSPORT_IMPL ti)
             if ((name && !strcmp(server_opts.endpts[i].name, name)) || (!name && (server_opts.endpts[i].ti == ti))) {
                 /* remove endpt */
                 lydict_remove(server_opts.ctx, server_opts.endpts[i].name);
-                pthread_mutex_destroy(&server_opts.endpts[i].lock);
                 switch (server_opts.endpts[i].ti) {
 #ifdef NC_ENABLED_SSH
                 case NC_TI_LIBSSH:
@@ -1704,8 +1783,11 @@ nc_server_del_endpt(const char *name, NC_TRANSPORT_IMPL ti)
         }
     }
 
-    /* WRITE UNLOCK */
+    /* ENDPT UNLOCK */
     pthread_rwlock_unlock(&server_opts.endpt_lock);
+
+    /* BIND UNLOCK */
+    pthread_mutex_unlock(&server_opts.bind_lock);
 
     return ret;
 }
@@ -1726,31 +1808,37 @@ nc_accept(int timeout, struct nc_session **session)
         return NC_MSG_ERROR;
     }
 
-    /* we have to hold WRITE for the whole time, since there is not
-     * a way of downgrading the lock to READ */
-    /* WRITE LOCK */
-    pthread_rwlock_wrlock(&server_opts.endpt_lock);
+    /* BIND LOCK */
+    pthread_mutex_lock(&server_opts.bind_lock);
 
     if (!server_opts.endpt_count) {
         ERR("No endpoints to accept sessions on.");
-        /* WRITE UNLOCK */
-        pthread_rwlock_unlock(&server_opts.endpt_lock);
+        /* BIND UNLOCK */
+        pthread_mutex_unlock(&server_opts.bind_lock);
         return NC_MSG_ERROR;
     }
 
     ret = nc_sock_accept_binds(server_opts.binds, server_opts.endpt_count, timeout, &host, &port, &bind_idx);
     if (ret < 1) {
-        /* WRITE UNLOCK */
-        pthread_rwlock_unlock(&server_opts.endpt_lock);
+        /* BIND UNLOCK */
+        pthread_mutex_unlock(&server_opts.bind_lock);
         free(host);
         if (!ret) {
             return NC_MSG_WOULDBLOCK;
         }
         return NC_MSG_ERROR;
     }
+
+    /* switch bind_lock for endpt_lock, so that another thread can accept another session */
+    /* ENDPT READ LOCK */
+    pthread_rwlock_rdlock(&server_opts.endpt_lock);
+
+    /* BIND UNLOCK */
+    pthread_mutex_unlock(&server_opts.bind_lock);
+
     sock = ret;
 
-    *session = calloc(1, sizeof **session);
+    *session = nc_new_session(0);
     if (!(*session)) {
         ERRMEM;
         close(sock);
@@ -1766,20 +1854,15 @@ nc_accept(int timeout, struct nc_session **session)
     (*session)->port = port;
 
     /* transport lock */
-    (*session)->ti_lock = malloc(sizeof *(*session)->ti_lock);
-    if (!(*session)->ti_lock) {
-        ERRMEM;
-        close(sock);
-        msgtype = NC_MSG_ERROR;
-        goto cleanup;
-    }
     pthread_mutex_init((*session)->ti_lock, NULL);
+    pthread_cond_init((*session)->ti_cond, NULL);
+    *(*session)->ti_inuse = 0;
 
     /* sock gets assigned to session or closed */
 #ifdef NC_ENABLED_SSH
     if (server_opts.endpts[bind_idx].ti == NC_TI_LIBSSH) {
         (*session)->data = server_opts.endpts[bind_idx].opts.ssh;
-        ret = nc_accept_ssh_session(*session, sock, timeout);
+        ret = nc_accept_ssh_session(*session, sock, NC_TRANSPORT_TIMEOUT);
         if (ret < 0) {
             msgtype = NC_MSG_ERROR;
             goto cleanup;
@@ -1792,7 +1875,7 @@ nc_accept(int timeout, struct nc_session **session)
 #ifdef NC_ENABLED_TLS
     if (server_opts.endpts[bind_idx].ti == NC_TI_OPENSSL) {
         (*session)->data = server_opts.endpts[bind_idx].opts.tls;
-        ret = nc_accept_tls_session(*session, sock, timeout);
+        ret = nc_accept_tls_session(*session, sock, NC_TRANSPORT_TIMEOUT);
         if (ret < 0) {
             msgtype = NC_MSG_ERROR;
             goto cleanup;
@@ -1811,7 +1894,7 @@ nc_accept(int timeout, struct nc_session **session)
 
     (*session)->data = NULL;
 
-    /* WRITE UNLOCK */
+    /* ENDPT UNLOCK */
     pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     /* assign new SID atomically */
@@ -1834,7 +1917,7 @@ nc_accept(int timeout, struct nc_session **session)
     return msgtype;
 
 cleanup:
-    /* WRITE UNLOCK */
+    /* ENDPT UNLOCK */
     pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     nc_session_free(*session, NULL);
@@ -2496,7 +2579,7 @@ nc_connect_ch_client_endpt(struct nc_ch_client *client, struct nc_ch_endpt *endp
         return NC_MSG_ERROR;
     }
 
-    *session = calloc(1, sizeof **session);
+    *session = nc_new_session(0);
     if (!(*session)) {
         ERRMEM;
         close(sock);
@@ -2510,14 +2593,9 @@ nc_connect_ch_client_endpt(struct nc_ch_client *client, struct nc_ch_endpt *endp
     (*session)->port = endpt->port;
 
     /* transport lock */
-    (*session)->ti_lock = malloc(sizeof *(*session)->ti_lock);
-    if (!(*session)->ti_lock) {
-        ERRMEM;
-        close(sock);
-        msgtype = NC_MSG_ERROR;
-        goto fail;
-    }
     pthread_mutex_init((*session)->ti_lock, NULL);
+    pthread_cond_init((*session)->ti_cond, NULL);
+    *(*session)->ti_inuse = 0;
 
     /* sock gets assigned to session or closed */
 #ifdef NC_ENABLED_SSH
@@ -2580,10 +2658,6 @@ fail:
     return msgtype;
 }
 
-/* ms */
-#define NC_CH_NO_ENDPT_WAIT 1000
-#define NC_CH_ENDPT_FAIL_WAIT 1000
-
 struct nc_ch_client_thread_arg {
     char *client_name;
     void (*session_clb)(const char *client_name, struct nc_session *new_session);
@@ -2643,11 +2717,7 @@ nc_server_ch_client_thread_session_cond_wait(struct nc_session *session, struct 
 
     do {
         nc_gettimespec(&ts);
-        ts.tv_nsec += NC_CH_NO_ENDPT_WAIT * 1000000L;
-        if (ts.tv_nsec > 1000000000L) {
-            ts.tv_sec += ts.tv_nsec / 1000000000L;
-            ts.tv_nsec %= 1000000000L;
-        }
+        nc_addtimespec(&ts, NC_CH_NO_ENDPT_WAIT);
 
         ret = pthread_cond_timedwait(session->opts.server.ch_cond, session->opts.server.ch_lock, &ts);
         if (ret && (ret != ETIMEDOUT)) {
@@ -2672,8 +2742,7 @@ nc_server_ch_client_thread_session_cond_wait(struct nc_session *session, struct 
             idle_timeout = client->conn.period.idle_timeout;
         }
 
-        /* TODO only for sessions without subscriptions */
-        if (idle_timeout && (ts.tv_sec >= session->opts.server.last_rpc + idle_timeout)) {
+        if (!session->opts.server.ntf_status && idle_timeout && (ts.tv_sec >= session->opts.server.last_rpc + idle_timeout)) {
             VRB("Call Home client \"%s\" session %u: session idle timeout elapsed.", client->name, session->id);
             session->status = NC_STATUS_INVALID;
             session->term_reason = NC_SESSION_TERM_TIMEOUT;
@@ -2714,7 +2783,7 @@ nc_ch_client_thread(void *arg)
     NC_MSG_TYPE msgtype;
     uint8_t cur_attempts = 0;
     uint16_t i;
-    char *cur_endpt_name;
+    char *cur_endpt_name = NULL;
     struct nc_ch_endpt *cur_endpt;
     struct nc_session *session;
     struct nc_ch_client *client;
@@ -2809,7 +2878,7 @@ nc_ch_client_thread(void *arg)
 
 cleanup:
     VRB("Call Home client \"%s\" thread exit.", data->client_name);
-
+    free(cur_endpt_name);
     free(data->client_name);
     free(data);
     return NULL;
@@ -2859,6 +2928,12 @@ nc_connect_ch_client_dispatch(const char *client_name,
 
 #endif /* NC_ENABLED_SSH || NC_ENABLED_TLS */
 
+API int
+nc_server_endpt_count(void)
+{
+    return server_opts.endpt_count;
+}
+
 API time_t
 nc_session_get_start_time(const struct nc_session *session)
 {
@@ -2868,4 +2943,26 @@ nc_session_get_start_time(const struct nc_session *session)
     }
 
     return session->opts.server.session_start;
+}
+
+API void
+nc_session_set_notif_status(struct nc_session *session, int notif_status)
+{
+    if (!session || (session->side != NC_SERVER)) {
+        ERRARG("session");
+        return;
+    }
+
+    session->opts.server.ntf_status = (notif_status ? 1 : 0);
+}
+
+API int
+nc_session_get_notif_status(const struct nc_session *session)
+{
+    if (!session || (session->side != NC_SERVER)) {
+        ERRARG("session");
+        return 0;
+    }
+
+    return session->opts.server.ntf_status;
 }

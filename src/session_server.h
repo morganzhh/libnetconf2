@@ -217,6 +217,15 @@ int nc_ps_add_session(struct nc_pollsession *ps, struct nc_session *session);
 int nc_ps_del_session(struct nc_pollsession *ps, struct nc_session *session);
 
 /**
+ * @brief Get a session from a pollsession structure matching the session ID.
+ *
+ * @param[in] ps Pollsession structure to read from.
+ * @param[in] sid Session ID of the session.
+ * @return Matching session or NULL on not found.
+ */
+struct nc_session *nc_ps_get_session_by_sid(const struct nc_pollsession *ps, uint32_t sid);
+
+/**
  * @brief Learn the number of sessions in a pollsession structure.
  *
  * Does not lock \p ps structure for efficiency.
@@ -236,22 +245,23 @@ uint16_t nc_ps_session_count(struct nc_pollsession *ps);
 #define NC_PSPOLL_ERROR 0x0080         /**< Other fatal errors (they are printed). */
 
 #ifdef NC_ENABLED_SSH
-#   define NC_PSPOLL_SSH_MSG 0x0100       /**< SSH message received (and processed, if relevant, only with SSH support). */
+#   define NC_PSPOLL_SSH_MSG 0x00100      /**< SSH message received (and processed, if relevant, only with SSH support). */
 #   define NC_PSPOLL_SSH_CHANNEL 0x0200   /**< New SSH channel opened on an existing session (only with SSH support). */
 #endif
 
 /**
  * @brief Poll sessions and process any received RPCs.
  *
- * All the sessions must be running. Only one event on one session
- * is handled in one function call.
+ * Only one event on one session is handled in one function call. If this event
+ * is a session termination (#NC_PSPOLL_SESSION_TERM returned), the session
+ * should be removed from \p ps.
  *
  * @param[in] ps Pollsession structure to use.
  * @param[in] timeout Poll timeout in milliseconds. 0 for non-blocking call, -1 for
  *                    infinite waiting.
  * @param[in] session Session that was processed and that specific return bits concern.
  *                    Can be NULL.
- * @return Bitfield of NC_PSPOLL_* macros, almost any combination can be returned.
+ * @return Bitfield of NC_PSPOLL_* macros.
  */
 int nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **session);
 
@@ -259,7 +269,7 @@ int nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **sessi
  * @brief Remove sessions from a pollsession structure and
  *        call nc_session_free() on them.
  *
- * Calling this function with \p all false makes sense if nc_ps_poll() returned 3.
+ * Calling this function with \p all false makes sense if nc_ps_poll() returned #NC_PSPOLL_SESSION_TERM.
  *
  * @param[in] ps Pollsession structure to clear.
  * @param[in] all Whether to free all sessions, or only the invalid ones.
@@ -293,6 +303,15 @@ int nc_server_add_endpt(const char *name, NC_TRANSPORT_IMPL ti);
 int nc_server_del_endpt(const char *name, NC_TRANSPORT_IMPL ti);
 
 /**
+ * @brief Get the number of currently configured listening endpoints.
+ * Note that an ednpoint without address and/or port will be included
+ * even though it is not, in fact, listening.
+ *
+ * @return Number of added listening endpoints.
+ */
+int nc_server_endpt_count(void);
+
+/**
  * @brief Change endpoint listening address.
  *
  * On error the previous listening socket (if any) is left untouched.
@@ -317,6 +336,10 @@ int nc_server_endpt_set_port(const char *endpt_name, uint16_t port);
 /**
  * @brief Accept new sessions on all the listening endpoints.
  *
+ * Once a new (TCP/IP) conection is established a different (quite long) timeout
+ * is used for waiting for transport-related data, which means this call can block
+ * for much longer that \p timeout, but only with slow/faulty/malicious clients.
+ *
  * @param[in] timeout Timeout for receiving a new connection in milliseconds, 0 for
  *                    non-blocking call, -1 for infinite waiting.
  * @param[out] session New session.
@@ -331,7 +354,7 @@ NC_MSG_TYPE nc_accept(int timeout, struct nc_session **session);
 
 /**
  * @brief Accept a new NETCONF session on an SSH session of a running NETCONF \p orig_session.
- *        Call this function only when nc_ps_poll() returns NC_PSPOLL_SSH_CHANNEL on \p orig_session.
+ *        Call this function only when nc_ps_poll() returns #NC_PSPOLL_SSH_CHANNEL on \p orig_session.
  *
  * @param[in] orig_session Session that has a new SSH channel ready.
  * @param[out] session New session.
@@ -342,7 +365,7 @@ NC_MSG_TYPE nc_session_accept_ssh_channel(struct nc_session *orig_session, struc
 
 /**
  * @brief Accept a new NETCONF session on an SSH session of a running NETCONF session
- *        that was polled in \p ps. Call this function only when nc_ps_poll() on \p ps returns NC_PSPOLL_SSH_CHANNEL.
+ *        that was polled in \p ps. Call this function only when nc_ps_poll() on \p ps returns #NC_PSPOLL_SSH_CHANNEL.
  *        The new session is only returned in \p session, it is not added to \p ps.
  *
  * @param[in] ps Unmodified pollsession structure from the previous nc_ps_poll() call.
@@ -657,5 +680,24 @@ void nc_server_tls_set_verify_clb(int (*verify_clb)(const struct nc_session *ses
  * @return Session start time.
  */
 time_t nc_session_get_start_time(const struct nc_session *session);
+
+/**
+ * @brief Set session notification subscription flag.
+ *
+ * It is used only to ignore timeouts, because they are
+ * ignored for sessions with active subscriptions.
+ *
+ * @param[in] session Session to modify.
+ * @param[in] notif_status 0 for no active subscriptions, non-zero for an active subscription.
+ */
+void nc_session_set_notif_status(struct nc_session *session, int notif_status);
+
+/**
+ * @brief Get session notification subscription flag.
+ *
+ * @param[in] session Session to get the information from.
+ * @return 0 for no active subscription, non-zero for an active subscription.
+ */
+int nc_session_get_notif_status(const struct nc_session *session);
 
 #endif /* NC_SESSION_SERVER_H_ */

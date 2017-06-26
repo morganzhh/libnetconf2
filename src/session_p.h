@@ -173,9 +173,12 @@ struct nc_server_opts {
     void (*hostkey_data_free)(void *data);
 #endif
 
-    /* ACCESS locked, add/remove binds/endpts - WRITE lock endpt_array_lock
-     *                modify binds/endpts - READ lock endpt_array_lock + endpt_lock */
+    /* ACCESS locked, add/remove endpts/binds - bind_lock + WRITE endpt_lock (strict order!)
+     *                modify endpts - WRITE endpt_lock
+     *                access endpts - READ endpt_lock
+     *                modify/poll binds - bind_lock */
     struct nc_bind *binds;
+    pthread_mutex_t bind_lock;
     struct nc_endpt {
         const char *name;
         NC_TRANSPORT_IMPL ti;
@@ -187,7 +190,6 @@ struct nc_server_opts {
             struct nc_server_tls_opts *tls;
 #endif
         } opts;
-        pthread_mutex_t lock;
     } *endpts;
     uint16_t endpt_count;
     pthread_rwlock_t endpt_lock;
@@ -242,18 +244,35 @@ struct nc_server_opts {
 
 /**
  * Timeout in msec for transport-related data to arrive (ssh_handle_key_exchange(), SSL_accept(), SSL_connect()).
+ * It can be quite a lot on slow machines (waiting for TLS cert-to-name resolution, ...).
  */
-#define NC_TRANSPORT_TIMEOUT 2000
+#define NC_TRANSPORT_TIMEOUT 10000
+
+/**
+ * Timeout in msec for acquiring a lock of a session (used with a condition, so higher numbers could be required
+ * only in case of extreme concurrency).
+ */
+#define NC_SESSION_LOCK_TIMEOUT 500
 
 /**
  * Timeout in msec for acquiring a lock of a session that is supposed to be freed.
  */
-#define NC_SESSION_FREE_LOCK_TIMEOUT 5000
+#define NC_SESSION_FREE_LOCK_TIMEOUT 1000
 
 /**
  * Timeout in msec for acquiring a lock of a pollsession structure.
  */
 #define NC_PS_LOCK_TIMEOUT 500
+
+/**
+ * Time slept in msec if no endpoint was created for a running Call Home client.
+ */
+#define NC_CH_NO_ENDPT_WAIT 1000
+
+/**
+ * Time slept in msec after a failed Call Home endpoint session creation.
+ */
+#define NC_CH_ENDPT_FAIL_WAIT 1000
 
 /**
  * Number of sockets kept waiting to be accepted.
@@ -303,6 +322,9 @@ struct nc_session {
     NC_TRANSPORT_IMPL ti_type;   /**< transport implementation type to select items from ti union */
     pthread_mutex_t *ti_lock;    /**< lock to access ti. Note that in case of libssh TI, it can be shared with other
                                       NETCONF sessions on the same SSH session (but different SSH channel) */
+    pthread_cond_t *ti_cond;     /**< ti_inuse condition */
+    volatile int *ti_inuse;      /**< variable indicating whether TI is being communicated on or not, protected by
+                                      ti_cond and ti_lock */
     union {
         struct {
             int in;              /**< input file descriptor */
@@ -336,7 +358,7 @@ struct nc_session {
         struct {
             /* client side only data */
             uint64_t msgid;
-            const char **cpblts;           /**< list of server's capabilities on client side */
+            char **cpblts;                 /**< list of server's capabilities on client side */
             struct nc_msg_cont *replies;   /**< queue for RPC replies received instead of notifications */
             struct nc_msg_cont *notifs;    /**< queue for notifications received instead of RPC reply */
             volatile pthread_t *ntf_tid;   /**< running notifications receiving thread */
@@ -349,6 +371,7 @@ struct nc_session {
             /* server side only data */
             time_t session_start;          /**< time the session was created */
             time_t last_rpc;               /**< time the last RPC was received on this session */
+            int ntf_status;                /**< flag whether the session is subscribed to any stream */
             pthread_mutex_t *ch_lock;      /**< Call Home thread lock */
             pthread_cond_t *ch_cond;       /**< Call Home thread condition */
 
@@ -372,9 +395,18 @@ struct nc_session {
     } opts;
 };
 
+enum nc_ps_session_state {
+    NC_PS_STATE_NONE = 0,      /**< session is not being worked with */
+    NC_PS_STATE_BUSY,          /**< session is being polled or communicated on (and locked) */
+    NC_PS_STATE_INVALID        /**< session is invalid and was already returned by another poll */
+};
+
 /* ACCESS locked */
 struct nc_pollsession {
-    struct nc_session **sessions;
+    struct {
+        struct nc_session *session;
+        enum nc_ps_session_state state;
+    } *sessions;
     uint16_t session_count;
     uint16_t last_event_session;
 
@@ -400,9 +432,15 @@ int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *absti
 
 int nc_gettimespec(struct timespec *ts);
 
-uint32_t nc_difftimespec(struct timespec *ts1, struct timespec *ts2);
+int32_t nc_difftimespec(struct timespec *ts1, struct timespec *ts2);
 
-int nc_timedlock(pthread_mutex_t *lock, int timeout, const char *func);
+void nc_addtimespec(struct timespec *ts, uint32_t msec);
+
+struct nc_session *nc_new_session(int not_allocate_ti);
+
+int nc_session_lock(struct nc_session *session, int timeout, const char *func);
+
+int nc_session_unlock(struct nc_session *session, int timeout, const char *func);
 
 int nc_ps_lock(struct nc_pollsession *ps, uint8_t *id, const char *func);
 
@@ -477,14 +515,7 @@ int nc_sock_accept_binds(struct nc_bind *binds, uint16_t bind_count, int timeout
  * @param[out] idx Index of the endpoint. Optional.
  * @return Endpoint structure.
  */
-struct nc_endpt *nc_server_endpt_lock(const char *name, NC_TRANSPORT_IMPL ti, uint16_t *idx);
-
-/**
- * @brief Unlock endpoint strcutures and the specific endpoint.
- *
- * @param[in] endpt Locked endpoint structure.
- */
-void nc_server_endpt_unlock(struct nc_endpt *endpt);
+struct nc_endpt *nc_server_endpt_lock_get(const char *name, NC_TRANSPORT_IMPL ti, uint16_t *idx);
 
 /**
  * @brief Lock CH client structures for reading and the specific client.

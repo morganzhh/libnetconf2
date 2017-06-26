@@ -935,13 +935,13 @@ nc_server_tls_endpt_set_server_cert(const char *endpt_name, const char *name)
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_set_server_cert(name, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1017,13 +1017,13 @@ nc_server_tls_endpt_add_trusted_cert_list(const char *endpt_name, const char *na
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_add_trusted_cert_list(name, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1112,13 +1112,13 @@ nc_server_tls_endpt_del_trusted_cert_list(const char *endpt_name, const char *na
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_del_trusted_cert_list(name, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1185,13 +1185,13 @@ nc_server_tls_endpt_set_trusted_ca_paths(const char *endpt_name, const char *ca_
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_set_trusted_ca_paths(ca_file, ca_dir, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1279,13 +1279,13 @@ nc_server_tls_endpt_set_crl_paths(const char *endpt_name, const char *crl_file, 
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_set_crl_paths(crl_file, crl_dir, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1337,13 +1337,13 @@ nc_server_tls_endpt_clear_crls(const char *endpt_name)
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return;
     }
     nc_server_tls_clear_crls(endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 }
 
 API void
@@ -1440,13 +1440,13 @@ nc_server_tls_endpt_add_ctn(const char *endpt_name, uint32_t id, const char *fin
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_add_ctn(id, fingerprint, map_type, name, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1542,13 +1542,13 @@ nc_server_tls_endpt_del_ctn(const char *endpt_name, int64_t id, const char *fing
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_del_ctn(id, fingerprint, map_type, name, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1634,13 +1634,13 @@ nc_server_tls_endpt_get_ctn(const char *endpt_name, uint32_t *id, char **fingerp
     }
 
     /* LOCK */
-    endpt = nc_server_endpt_lock(endpt_name, NC_TI_OPENSSL, NULL);
+    endpt = nc_server_endpt_lock_get(endpt_name, NC_TI_OPENSSL, NULL);
     if (!endpt) {
         return -1;
     }
     ret = nc_server_tls_get_ctn(id, fingerprint, map_type, name, endpt->opts.tls);
     /* UNLOCK */
-    nc_server_endpt_unlock(endpt);
+    pthread_rwlock_unlock(&server_opts.endpt_lock);
 
     return ret;
 }
@@ -1845,7 +1845,8 @@ nc_accept_tls_session(struct nc_session *session, int sock, int timeout)
     SSL_CTX *tls_ctx;
     X509_LOOKUP *lookup;
     struct nc_server_tls_opts *opts;
-    int ret, elapsed_usec = 0;
+    int ret;
+    struct timespec ts_timeout, ts_cur;
 
     opts = session->data;
 
@@ -1918,12 +1919,18 @@ nc_accept_tls_session(struct nc_session *session, int sock, int timeout)
     pthread_once(&verify_once, nc_tls_make_verify_key);
     pthread_setspecific(verify_key, session);
 
+    if (timeout > -1) {
+        nc_gettimespec(&ts_timeout);
+        nc_addtimespec(&ts_timeout, timeout);
+    }
     while (((ret = SSL_accept(session->ti.tls)) == -1) && (SSL_get_error(session->ti.tls, ret) == SSL_ERROR_WANT_READ)) {
         usleep(NC_TIMEOUT_STEP);
-        elapsed_usec += NC_TIMEOUT_STEP;
-        if ((timeout > -1) && (elapsed_usec / 1000 >= timeout)) {
-            ERR("SSL_accept timeout.");
-            return 0;
+        if (timeout > -1) {
+            nc_gettimespec(&ts_cur);
+            if (nc_difftimespec(&ts_cur, &ts_timeout) < 1) {
+                ERR("SSL_accept timeout.");
+                return 0;
+            }
         }
     }
 
