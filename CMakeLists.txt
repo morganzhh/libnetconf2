@@ -83,7 +83,7 @@ set(headers
 
 # libnetconf2 target
 add_library(netconf2 SHARED ${libsrc})
-set_target_properties(netconf2 PROPERTIES VERSION ${LIBNETCONF2_VERSION} SOVERSION ${LIBNETCONF2_SOVERSION})
+# set_target_properties(netconf2 PROPERTIES VERSION ${LIBNETCONF2_VERSION} SOVERSION ${LIBNETCONF2_SOVERSION})
 
 if(CMAKE_BUILD_TYPE STREQUAL debug)
     option(ENABLE_BUILD_TESTS "Build tests" ON)
