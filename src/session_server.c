@@ -724,10 +724,14 @@ nc_ps_add_session(struct nc_pollsession *ps, struct nc_session *session)
         return -1;
     }
 
+    ERR("nc_ps_add_session called before lock!!!!!");
+
     /* LOCK */
     if (nc_ps_lock(ps, &q_id, __func__)) {
         return -1;
     }
+
+    ERR("nc_ps_add_session called after lock session_count=%d !!!!!", ps->session_count);
 
     ++ps->session_count;
     ps->pfds = nc_realloc(ps->pfds, ps->session_count * sizeof *ps->pfds);

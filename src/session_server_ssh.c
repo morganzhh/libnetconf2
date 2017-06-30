@@ -1090,7 +1090,7 @@ nc_ssh_pollin(struct nc_session *session, int timeout)
     }
 
     /* no new SSH message, maybe NETCONF data? */
-    ret = ssh_channel_poll_timeout(session->ti.libssh.channel, 0, 0);
+    ret = ssh_channel_poll_timeout(session->ti.libssh.channel, 2000, 0);
     /* not this one */
     if (!ret) {
         return NC_PSPOLL_PENDING;
