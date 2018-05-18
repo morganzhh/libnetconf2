@@ -262,7 +262,7 @@ struct nc_server_opts {
 /**
  * Timeout in msec for acquiring a lock of a pollsession structure.
  */
-#define NC_PS_LOCK_TIMEOUT 500
+#define NC_PS_LOCK_TIMEOUT 2000
 
 /**
  * Time slept in msec if no endpoint was created for a running Call Home client.
