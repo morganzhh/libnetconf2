@@ -41,6 +41,7 @@ struct nc_server_opts server_opts = {
 };
 
 static nc_rpc_clb global_rpc_clb = NULL;
+int global_ps_timeout = 0;
 
 struct nc_endpt *
 nc_server_endpt_lock_get(const char *name, NC_TRANSPORT_IMPL ti, uint16_t *idx)
@@ -715,6 +716,14 @@ nc_ps_lock(struct nc_pollsession *ps, uint8_t *id, const char *func)
             ERR("%s: failed to wait for a pollsession condition (%s).", func, strerror(ret));
             /* remove ourselves from the queue */
             nc_ps_queue_remove_id(ps, *id);
+		/*workaround for pollsession time out, if ps->cond took more than 1m, release it*/	
+		global_ps_timeout++;
+		if(global_ps_timeout > 30)
+		{
+		       global_ps_timeout = 0;
+		       if(pthread_cond_broadcast(&ps->cond))
+		         ERR("pthread_cond_broadcast error");
+		}
             pthread_mutex_unlock(&ps->lock);
             return -1;
         }
